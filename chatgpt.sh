@@ -231,6 +231,13 @@ while [[ "$#" -gt 0 ]]; do
 		;;
 	-p | --prompt)
 		prompt="$2"
+		if ! [ -t 0 ]; then
+			piped_input=""
+			while IFS= read -r line; do
+				piped_input+="$line\n"
+			done
+			prompt="$prompt $piped_input"
+    	fi	
 		shift
 		shift
 		;;
