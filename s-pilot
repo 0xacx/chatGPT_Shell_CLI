@@ -1,6 +1,6 @@
 # !/bin/bash
 # set -x
-SHELL_PILOT_CONFIG_PATH="/Users/guliu/src/test"
+SHELL_PILOT_CONFIG_PATH="/usr/local/bin"
 COMMON_CONFIG_FILE="${SHELL_PILOT_CONFIG_PATH}/spilot_common.sh"
 source $COMMON_CONFIG_FILE
 
