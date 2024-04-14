@@ -1,0 +1,656 @@
+# !/bin/bash
+# set -x
+SHELL_PILOT_CONFIG_PATH="/Users/guliu/src/test"
+COMMON_CONFIG_FILE="${SHELL_PILOT_CONFIG_PATH}/spilot_common.sh"
+source $COMMON_CONFIG_FILE
+
+# check if the OPENAI_KEY is set
+if [[ -z "$OPENAI_KEY" && "$USE_API" == "openai" ]]; then
+	echo "You need to set your OPENAI_KEY to use this script!"
+	echo "You can set it temporarily by running this on your terminal: export OPENAI_KEY=YOUR_KEY_HERE"
+	exit 1
+fi
+
+# check if the OLLAMA host is set
+if [[ "$USE_API" == "ollama" ]]; then
+	if [[ -z "$OLLAMA_SERVER_IP" ]]; then
+		echo "Error: OLLAMA_SERVER_IP is not set in the configuration file."
+		exit 1
+	fi
+	if ! [[ $OLLAMA_SERVER_IP =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+		echo "Error: OLLAMA_SERVER_IP is not a valid IP address."
+		exit 1
+	fi
+fi
+
+usage() {
+	cat <<EOF
+A simple, lightweight shell script to use OpenAI's Language Models and DALL-E 
+or Ollama models from the terminal without installing Python or Node.js.
+Open Source and written in 100% Shell (Bash).
+
+https://github.com/reid41/shell-pilot.git
+
+For OpenAI:
+By default the script uses the "gpt-3.5-turbo" model. 
+It will upgrade to "gpt-4" when the API is accessible to anyone.
+
+For Ollama:
+By default the script uses the "llama2" model.
+
+It will enter "chat" mode without any options, here are some commands you can use:
+
+Commands:
+  history - To view your chat history
+  models - To get a list of the models available at OpenAI API
+  model: - To view all the information on a specific model, start a prompt with model: and the model id as it appears in the list of models. For example: "model:text-babbage:001" will get you all the fields for text-babbage:001 model
+  cmd: - To get a command with the specified functionality and run it, just type "cmd:" and explain what you want to achieve. The script will always ask you if you want to execute the command.
+
+Options:
+  cmp, -cmp, --change-model-provider   Change the model provider between OpenAI and Ollama
+
+  ip, -ip, --init-prompt               Provide initial chat prompt to use in context
+
+  ipf, -ipf --init-prompt-from-file    Provide initial prompt from file
+
+  p, -p, --prompt                      Provide prompt instead of starting chat
+
+  pf, --prompt-from-file               Provide prompt from file
+
+  mlp | -mlp | --multi-line-prompt     Allow multi-line prompts during chat mode
+
+  t, -t, --temperature                 Update Temperature
+
+  mt, -mt --max-tokens                 Update Max number of tokens
+
+  lc, -lc, --list-config               List s-pilot common config
+
+  lm, -lm, --list-models               List available openAI/ollama models
+
+  m, -m, --model                       Update the Model to use
+
+  h, -h, --help                        list available options and usage
+
+  c, -c, --chat-context      For models that do not support chat context by
+                             default (all models except gpt-3.5-turbo and
+                             gpt-4), you can enable chat context, for the
+                             model to remember your previous questions and
+                             its previous answers. It also makes models
+                             aware of todays date and what data it was trained
+                             on.
+
+EOF
+}
+
+# error handling function
+# $1 should be the response body
+handle_error() {
+	# check if USE_API is openai
+	if [[ "$USE_API" == "openai" ]]; then
+		if echo "$1" | jq -e '.error' >/dev/null; then
+			echo -e "Your request to Open AI API failed: \033[0;31m$(echo "$1" | jq -r '.error.type')\033[0m"
+			echo "$1" | jq -r '.error.message'
+			exit 1
+		fi
+	fi
+}
+
+# conver the model size to human readable format
+convert_size() {
+    local -i bytes=$1
+    if [[ $bytes -ge 1073741824 ]]; then
+        printf "%.2f GB" "$(echo "scale=2; $bytes / 1073741824" | bc)"
+    elif [[ $bytes -ge 1048576 ]]; then
+        printf "%.2f MB" "$(echo "scale=2; $bytes / 1048576" | bc)"
+    else
+        printf "%d bytes" "$bytes"
+    fi
+}
+
+# request to openAI/ollama API models endpoint. Returns a list of models
+# takes no input parameters
+list_models() {
+	if [[ "$USE_API" == "ollama" ]]
+	then
+		# get the list of models
+		curl -s http://${OLLAMA_SERVER_IP}:11434/api/tags | jq -c '.models[]' | while read -r model; do
+
+			# show processing label
+			echo -ne "$OVERWRITE_PROCESSING_LINE"
+			echo -ne "$PROCESSING_LABEL"
+			sleep 0.5 # set delay to avoid flickering
+			echo -ne "$OVERWRITE_PROCESSING_LINE"
+
+			# get the model details
+			name=$(echo "$model" | jq -r '.name')
+			size=$(echo "$model" | jq -r '.size')
+			format=$(echo "$model" | jq -r '.details.format')
+			parameter_size=$(echo "$model" | jq -r '.details.parameter_size')
+			quantization_level=$(echo "$model" | jq -r '.details.quantization_level')
+
+			# convert size to human readable format
+			converted_size=$(convert_size $size)
+
+			# build a new JSON object with the model details
+			new_json=$(jq -n --arg name "$name" \
+							--arg size "$converted_size" \
+							--arg format "$format" \
+							--arg parameter_size "$parameter_size" \
+							--arg quantization_level "$quantization_level" \
+							'{
+								name: $name,
+								size: $size,
+								format: $format,
+								parameter_size: $parameter_size,
+								quantization_level: $quantization_level
+							}')
+			
+			echo "$new_json"
+		done
+
+	elif [[ "$USE_API" == "openai" ]]
+	then
+		models_response=$(curl https://api.openai.com/v1/models \
+			-sS \
+			-H "Authorization: Bearer $OPENAI_KEY")
+		handle_error "$models_response"
+		models_data=$(echo $models_response | jq -r -C '.data[] | {id, owned_by, created}')
+		echo -e "$OVERWRITE_PROCESSING_LINE"
+		echo -e "${SHELLPILOT_CYAN_LABEL}This is a list of models currently available at OpenAI API:\n ${models_data}"
+	else
+		echo "Error: No API specified".
+		exit 1
+	fi
+}
+
+# request to OpenAI API/ollama completions endpoint function
+# $1 should be the request prompt
+request_to_completions() {
+	local prompt="$1"
+
+	if [[ "$USE_API" == "ollama" ]]
+	then
+		curl http://${OLLAMA_SERVER_IP}:11434/api/generate \
+		-sS \
+		-d '{
+			"model": "'"$MODEL_OLLAMA"'",
+			"prompt": "'"$prompt"'",
+			"max_tokens": '$MAX_TOKENS',
+			"temperature": '$TEMPERATURE',
+			"stream": false
+			}'
+	elif [[ "$USE_API" == "openai" ]]
+	then
+		curl https://api.openai.com/v1/completions \
+		-sS \
+		-H 'Content-Type: application/json' \
+		-H "Authorization: Bearer $OPENAI_KEY" \
+		-d '{
+			"model": "'"$MODEL_OPENAI"'",
+			"prompt": "'"$prompt"'",
+			"max_tokens": '$MAX_TOKENS',
+			"temperature": '$TEMPERATURE'
+			}'
+	else
+		echo "Error: No API specified".
+		exit 1
+	fi
+}
+
+# request to OpenAPI API/ollama chat completion endpoint function
+# $1 should be the message(s) formatted with role and content
+request_to_chat() {
+	local message="$1"
+	escaped_system_prompt=$(escape "$SYSTEM_PROMPT")
+	
+	if [[ "$USE_API" == "ollama" ]]
+	then
+		curl http://${OLLAMA_SERVER_IP}:11434/api/chat \
+		-sS \
+		-d '{
+            "model": "'"$MODEL_OLLAMA"'",
+            "messages": [
+                {"role": "system", "content": "'"$escaped_system_prompt"'"},
+                '"$message"'
+                ],
+            "max_tokens": '$MAX_TOKENS',
+            "temperature": '$TEMPERATURE',
+			"stream": false
+            }'
+	elif [[ "$USE_API" == "openai" ]]
+	then
+		curl https://api.openai.com/v1/chat/completions \
+			-sS \
+			-H 'Content-Type: application/json' \
+			-H "Authorization: Bearer $OPENAI_KEY" \
+			-d '{
+				"model": "'"$MODEL_OPENAI"'",
+				"messages": [
+					{"role": "system", "content": "'"$escaped_system_prompt"'"},
+					'"$message"'
+					],
+				"max_tokens": '$MAX_TOKENS',
+				"temperature": '$TEMPERATURE'
+				}'
+	else
+		echo "Error: No API specified".
+		exit 1
+	fi
+}
+
+# build chat context before each request for /completions (all models except
+# gpt turbo and gpt 4)
+# $1 should be the escaped request prompt,
+# it extends $chat_context
+build_chat_context() {
+	local escaped_request_prompt="$1"
+	if [ -z "$chat_context" ]; then
+		chat_context="$CHAT_INIT_PROMPT\nQ: $escaped_request_prompt"
+	else
+		chat_context="$chat_context\nQ: $escaped_request_prompt"
+	fi
+}
+
+escape() {
+	echo "$1" | jq -Rrs 'tojson[1:-1]'
+}
+
+# maintain chat context function for /completions (all models except
+# gpt turbo and gpt 4)
+# builds chat context from response,
+# keeps chat context length under max token limit
+# * $1 should be the escaped response data
+# * it extends $chat_context
+maintain_chat_context() {
+	local escaped_response_data="$1"
+	# add response to chat context as answer
+	chat_context="$chat_context${chat_context:+\n}\nA: $escaped_response_data"
+	# check prompt length, 1 word =~ 1.3 tokens
+	# reserving 100 tokens for next user prompt
+	while (($(echo "$chat_context" | wc -c) * 1, 3 > (MAX_TOKENS - 100))); do
+		# remove first/oldest QnA from prompt
+		chat_context=$(echo "$chat_context" | sed -n '/Q:/,$p' | tail -n +2)
+		# add init prompt so it is always on top
+		chat_context="$CHAT_INIT_PROMPT $chat_context"
+	done
+}
+
+# build user chat message function for /chat/completions (gpt models)
+# builds chat message before request,
+# $1 should be the escaped request prompt,
+# it extends $chat_message
+build_user_chat_message() {
+	local escaped_request_prompt="$1"
+	if [ -z "$chat_message" ]; then
+		chat_message="{\"role\": \"user\", \"content\": \"$escaped_request_prompt\"}"
+	else
+		chat_message="$chat_message, {\"role\": \"user\", \"content\": \"$escaped_request_prompt\"}"
+	fi
+}
+
+# adds the assistant response to the message in (chatml) format
+# for /chat/completions (gpt models)
+# keeps messages length under max token limit
+# * $1 should be the escaped response data
+# * it extends and potentially shrinks $chat_message
+add_assistant_response_to_chat_message() {
+	local escaped_response_data="$1"
+	# add response to chat context as answer
+	chat_message="$chat_message, {\"role\": \"assistant\", \"content\": \"$escaped_response_data\"}"
+
+	# transform to json array to parse with jq
+	local chat_message_json="[ $chat_message ]"
+	# check prompt length, 1 word =~ 1.3 tokens
+	# reserving 100 tokens for next user prompt
+	while (($(echo "$chat_message" | wc -c) * 1, 3 > (MAX_TOKENS - 100))); do
+		# remove first/oldest QnA from prompt
+		chat_message=$(echo "$chat_message_json" | jq -c '.[2:] | .[] | {role, content}')
+	done
+}
+
+# update spilot common config function
+update_config() {
+    local new_value="$1"
+    local config_var_name="$2"  # Variable name to update
+    local config_file="${SHELL_PILOT_CONFIG_PATH}/spilot_common.sh"
+    local backup_file="${config_file}.bak"
+
+    # Read the current value from the configuration file
+    local current_value=$(grep "^${config_var_name}=" "$config_file" | cut -d'=' -f2)
+
+    # Check if the value is already set to the new value
+    if [[ "$current_value" == "$new_value" ]]; then
+        echo "${config_var_name} is already set to $new_value. No update needed."
+        return 0
+    fi
+
+    # Backup the configuration file before updating
+    cp "$config_file" "$backup_file"
+
+    # Update the value in the configuration file
+    awk -v var_name="${config_var_name}=" -v new_val="$new_value" \
+        '$0 ~ var_name {print var_name new_val; next} 1' "$backup_file" > "$config_file"
+    echo "Attempting to update ${config_var_name} to $new_value."
+
+    # Read the updated value to confirm
+    local updated_value=$(grep "^${config_var_name}=" "$config_file" | cut -d'=' -f2)
+
+    # Check if the update was successful
+    if [[ "$updated_value" == "$new_value" ]]; then
+        if [ -f "$backup_file" ] && [[ "$current_value" != "$updated_value" ]]; then
+            rm "$backup_file"
+            echo "Backup file removed after successful update."
+        else
+            echo "${config_var_name} updated successfully to $new_value."
+        fi
+		echo "The setting will save in the configuration file."
+    else
+        echo "Failed to update ${config_var_name}. Restoring from backup."
+        mv "$backup_file" "$config_file"
+    fi
+}
+
+check_the_setting(){
+	local setting_name="$1"
+	local setting_variable="$2"
+	echo 
+	echo "Here is the checklist to change the ${setting_name}:"
+	grep ^${setting_variable} $COMMON_CONFIG_FILE
+	exit 0
+}
+
+
+# parse command line arguments
+while [[ "$#" -gt 0 ]]; do
+	case $1 in
+	ip | -ip | --init-prompt)
+		CHAT_INIT_PROMPT="$2"
+		SYSTEM_PROMPT="$2"
+		CONTEXT=true
+		shift
+		shift
+		;;
+	ipf | -ipf | --init-prompt-from-file)
+		CHAT_INIT_PROMPT=$(cat "$2")
+		SYSTEM_PROMPT=$(cat "$2")
+		CONTEXT=true
+		shift
+		shift
+		;;
+	p | -p | --prompt)
+		prompt="$2"
+		# get the pipeline result to the -p
+		# e.g. cat error.log | ./spilot.sh -p "check any errors"
+		if ! [ -t 0 ]; then
+			piped_input=""
+			while IFS= read -r line; do
+				piped_input+="$line\n"
+			done
+			prompt="$prompt $piped_input"
+    	fi
+		shift
+		shift
+		;;
+	pf | -pf | --prompt-from-file)
+		prompt=$(cat "$2")
+		shift
+		shift
+		;;
+	t | -t | --temperature)
+		update_config "$2" "TEMPERATURE"
+		check_the_setting "temperature" "TEMPERATURE"
+		;;
+	mt | -mt | --max-tokens)
+		update_config "$2" "MAX_TOKENS"
+		check_the_setting "max tokens" "MAX_TOKENS"
+		;;
+	lc | -lc | --list-config)
+		grep  ^USE_API -B 1 $COMMON_CONFIG_FILE 
+		echo
+		grep SYSTEM_PROMPT -A 1 -B 2 $COMMON_CONFIG_FILE
+		echo
+		tail -9 $COMMON_CONFIG_FILE
+		exit 0
+		;;
+	lm | -lm | --list-models)
+		list_models
+		exit 0
+		;;
+	m | --model)
+		if [[ "$USE_API" == "openai" ]]; then
+			update_config "$2" "MODEL_OPENAI"
+			check_the_setting "openai model" "MODEL_OPENAI"
+		elif [[ "$USE_API" == "ollama" ]]; then
+			update_config "$2" "MODEL_OLLAMA"
+			check_the_setting "ollama model" "MODEL_OLLAMA"
+		fi
+		;;
+	mlp | -mlp | --multi-line-prompt)
+		update_config "$2" "MULTI_LINE_PROMPT"
+		check_the_setting "multi-line prompt" "MULTI_LINE_PROMPT"
+		;;
+	c | -c | --chat-context)
+		update_config "$2" "CONTEXT"
+		check_the_setting "chat context"
+		;;
+	cmp | -cmp | --change-model-provider)
+		# check if the model provider is valid
+		if [[ "$2" == "openai" || "$2" == "ollama" ]]; then
+			# update the model provider
+			update_config "$2" "USE_API"
+			check_the_setting "model provider" "USE_API"
+		else
+			# print error message and exit if the model provider is invalid
+			echo -e "Error: Invalid model provider. Please choose \033[1;36mopenai\033[0m or \033[1;35mollama\033[0m."
+			exit 1
+		fi
+		;;
+	h | -h | --help)
+		usage
+		exit 0
+		;;
+	*)
+		echo "Unknown parameter: $1"
+		exit 1
+		;;
+	esac
+done
+
+# create our temp file for multi-line input
+if [ $MULTI_LINE_PROMPT = true ]; then
+	USER_INPUT_TEMP_FILE=$(mktemp)
+	trap 'rm -f ${USER_INPUT}' EXIT
+fi
+
+# create history file
+if [ ! -f ~/.chatgpt_history ]; then
+	touch ~/.chatgpt_history
+	chmod 600 ~/.chatgpt_history
+fi
+
+running=true
+# check input source and determine run mode
+
+# prompt from argument, run on pipe mode (run once, no chat)
+if [ -n "$prompt" ]; then
+	pipe_mode_prompt=${prompt}
+# if input file_descriptor is a terminal, run on chat mode
+elif [ -t 0 ]; then
+	echo -e "Welcome to \033[94mShell Pilot\033[0m!!\nYou can quit with '\033[36mq\033[0m' or '\033[36me\033[0m'."
+# prompt from pipe or redirected stdin, run on pipe mode
+else
+	pipe_mode_prompt+=$(cat -)
+fi
+
+while $running; do
+
+	if [ -z "$pipe_mode_prompt" ]; then
+		if [ $MULTI_LINE_PROMPT = true ]; then
+			echo -e "\nYou: (Press Enter then Ctrl-D to send)"
+			cat >"${USER_INPUT_TEMP_FILE}"
+			input_from_temp_file=$(cat "${USER_INPUT_TEMP_FILE}")
+			prompt=$(escape "$input_from_temp_file")
+		else
+			echo -e "\n\033[97m<<You>>\033[0m"
+			read -e prompt
+		fi
+		if [[ ! $prompt =~ ^(e|q)$ ]]; then
+			echo -ne $PROCESSING_LABEL
+		fi
+	else
+		# set vars for pipe mode
+		prompt=${pipe_mode_prompt}
+		running=false
+		SHELLPILOT_CYAN_LABEL=""
+	fi
+
+	if [[ $prompt =~ ^(e|q)$ ]]; then
+		running=false
+	elif [[ "$prompt" == "history" ]]; then
+		echo -ne "$OVERWRITE_PROCESSING_LINE"
+		echo -e "\n$(cat ~/.chatgpt_history)"
+	elif [[ "$prompt" == "models" ]]; then
+		list_models
+	elif [[ "$prompt" =~ ^model: ]]; then
+		if [[ "$USE_API" == "openai" ]]; then
+			models_response=$(curl https://api.openai.com/v1/models \
+				-sS \
+				-H "Authorization: Bearer $OPENAI_KEY")
+			handle_error "$models_response"
+			model_data=$(echo $models_response | jq -r -C '.data[] | select(.id=="'"${prompt#*model:}"'")')
+			echo -e "$OVERWRITE_PROCESSING_LINE"
+			echo -e "${SHELLPILOT_CYAN_LABEL}Complete details for model: ${prompt#*model:}\n ${model_data}"
+		elif [[ "$USE_API" == "ollama" ]]; then
+			echo -e "$OVERWRITE_PROCESSING_LINE"
+			# get the model name
+			escaped_prompt=$(escape "$prompt")
+			escaped_prompt=${escaped_prompt#model:}
+			escaped_prompt=$(echo "$escaped_prompt" | sed 's/\\n//g' | sed 's/\.//g')
+			echo -e "$OVERWRITE_PROCESSING_LINE"
+			curl -s http://${OLLAMA_SERVER_IP}:11434/api/show -d '{
+			"name": "'"$escaped_prompt"'"
+			}' | jq -r '[
+				"License: \(.license)",
+				"Format: \(.details.format)",
+				"Family: \(.details.family)",
+				"Parameter Size: \(.details.parameter_size)",
+				"Quantization Level: \(.details.quantization_level)"
+			] | .[]' 
+		else
+			echo "Error: No API specified".
+			exit 1
+		fi
+	elif [[ "$prompt" =~ ^cmd: ]]; then
+		# escape quotation marks, new lines, backslashes...
+		escaped_prompt=$(escape "$prompt")
+		escaped_prompt=${escaped_prompt#cmd:}
+		request_prompt=$COMMAND_GENERATION_PROMPT$escaped_prompt
+		build_user_chat_message "$request_prompt"
+		response=$(request_to_chat "$chat_message")
+		# response=$(request_to_chat_ollama "$chat_message")
+		handle_error "$response"
+		if [[ "$USE_API" == "ollama" ]]; then
+			response_data=$(echo $response | jq -r '.message.content')
+		elif [[ "$USE_API" == "openai" ]]; then
+			response_data=$(echo $response | jq -r '.choices[].message.content')
+		fi
+
+		if [[ "$prompt" =~ ^cmd: ]]; then
+			echo -e "$OVERWRITE_PROCESSING_LINE"
+			echo -e "${SHELLPILOT_CYAN_LABEL} ${response_data}" | fold -s -w $COLUMNS
+			dangerous_commands=("rm" ">" "mv" "mkfs" ":(){:|:&};" "dd" "chmod" "wget" "curl")
+			# Initially, consider no dangerous command found
+			DANGER_CMD_FOUND=false
+
+			for dangerous_command in "${dangerous_commands[@]}"; do
+				if [[ "$response_data" == *"$dangerous_command"* ]]; then
+					echo -e "\033[33mWarning: This command can change your file system or download external scripts & data.\nPlease do not execute code that you don't understand completely.\033[0m"
+					DANGER_CMD_FOUND=true
+				fi
+			done
+
+			# Check if dangerous commands are found and if the flag to enable execution is set
+			if [[ "$DANGER_FOUND" == true && "$ENABLE_DANGER_FLAG" == true ]]; then
+				echo -e "\033[36mWould you like to execute this potentially dangerous command? (Yes/No)\033[0m"
+				read run_answer
+				if [[ "$run_answer" == "Yes" ]] || [[ "$run_answer" == "yes" ]] || [[ "$run_answer" == "y" ]] || [[ "$run_answer" == "Y" ]]; then
+					execute_cmd=$(echo "$response_data" | sed 's/[`$]//g')
+					echo -e "\nExecuting command: $execute_cmd\n"
+					eval "$execute_cmd"
+				fi
+			elif [[ "$DANGER_CMD_FOUND" == false ]]; then
+				echo -e "\033[36mWould you like to execute it? (Yes/No)\033[0m"
+				read run_answer
+				if [[ "$run_answer" == "Yes" ]] || [[ "$run_answer" == "yes" ]] || [[ "$run_answer" == "y" ]] || [[ "$run_answer" == "Y" ]]; then
+					execute_cmd=$(echo "$response_data" | sed 's/[`$]//g')
+					echo -e "\nExecuting command: $execute_cmd\n"
+					eval "$execute_cmd"
+				fi
+			else
+				echo
+				echo -e "\033[36mInfo: Execution of potentially dangerous commands has been disabled.\033[0m"
+
+
+			fi
+		fi
+		add_assistant_response_to_chat_message "$(escape "$response_data")"
+
+		timestamp=$(date +"%Y-%m-%d %H:%M")
+		echo -e "$timestamp $prompt \n$response_data \n" >>~/.chatgpt_history
+
+	elif [[ "$MODEL_OPENAI" =~ ^gpt- || "$USE_API" == "ollama" ]]; then
+		# escape quotation marks, new lines, backslashes...
+		request_prompt=$(escape "$prompt")
+
+		build_user_chat_message "$request_prompt"
+		response=$(request_to_chat "$chat_message")
+		handle_error "$response"
+		if [[ "$USE_API" == "ollama" ]]; then
+			response_data=$(echo $response | jq -r '.message.content')
+		elif [[ "$USE_API" == "openai" ]]; then
+			response_data=$(echo $response | jq -r '.choices[].message.content')
+		fi
+
+		echo -e "$OVERWRITE_PROCESSING_LINE"
+		# if glow installed, print parsed markdown
+		if command -v glow &>/dev/null; then
+			echo -e "${SHELLPILOT_CYAN_LABEL}"
+			echo "${response_data}" | glow -
+		else
+			echo -e "${SHELLPILOT_CYAN_LABEL}${response_data}" | fold -s -w "$COLUMNS"
+		fi
+		add_assistant_response_to_chat_message "$(escape "$response_data")"
+
+		timestamp=$(date +"%Y-%m-%d %H:%M")
+		echo -e "$timestamp $prompt \n$response_data \n" >>~/.chatgpt_history
+	else
+		# escape quotation marks, new lines, backslashes...
+		request_prompt=$(escape "$prompt")
+
+		if [ "$CONTEXT" = true ]; then
+			build_chat_context "$request_prompt"
+		fi
+
+		response=$(request_to_completions "$request_prompt")
+		handle_error "$response"
+		response_data=$(echo "$response" | jq -r '.choices[].text')
+
+		echo -e "$OVERWRITE_PROCESSING_LINE"
+		# if glow installed, print parsed markdown
+		if command -v glow &>/dev/null; then
+			echo -e "${SHELLPILOT_CYAN_LABEL}"
+			echo "${response_data}" | glow -
+		else
+			# else remove empty lines and print
+			formatted_text=$(echo "${response_data}" | sed '1,2d; s/^A://g')
+			echo -e "${SHELLPILOT_CYAN_LABEL}${formatted_text}" | fold -s -w $COLUMNS
+		fi
+
+		if [ "$CONTEXT" = true ]; then
+			maintain_chat_context "$(escape "$response_data")"
+		fi
+
+		timestamp=$(date +"%Y-%m-%d %H:%M")
+		echo -e "$timestamp $prompt \n$response_data \n" >>~/.chatgpt_history
+	fi
+done
