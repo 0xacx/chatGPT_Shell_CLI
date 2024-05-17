@@ -415,13 +415,17 @@ while $running; do
 		handle_error "$response"
 		response_data=$(echo "$response" | jq -r '.choices[].message.content')
 
-		echo -e "$OVERWRITE_PROCESSING_LINE"
-		# if glow installed, print parsed markdown
-		if command -v glow &>/dev/null; then
-			echo -e "${CHATGPT_CYAN_LABEL}"
-			echo "${response_data}" | glow -
+		if [ -t 1 ]; then
+			echo -e "$OVERWRITE_PROCESSING_LINE"
+			# if glow installed, print parsed markdown
+			if command -v glow &>/dev/null; then
+				echo -e "${CHATGPT_CYAN_LABEL}"
+				echo "${response_data}" | glow -
+			else
+				echo -e "${CHATGPT_CYAN_LABEL}${response_data}" | fold -s -w "$COLUMNS"
+			fi
 		else
-			echo -e "${CHATGPT_CYAN_LABEL}${response_data}" | fold -s -w "$COLUMNS"
+			echo "${response_data}"
 		fi
 		add_assistant_response_to_chat_message "$(escape "$response_data")"
 
@@ -439,15 +443,19 @@ while $running; do
 		handle_error "$response"
 		response_data=$(echo "$response" | jq -r '.choices[].text')
 
-		echo -e "$OVERWRITE_PROCESSING_LINE"
-		# if glow installed, print parsed markdown
-		if command -v glow &>/dev/null; then
-			echo -e "${CHATGPT_CYAN_LABEL}"
-			echo "${response_data}" | glow -
+		if [ -t 1 ]; then
+			echo -e "$OVERWRITE_PROCESSING_LINE"
+			# if glow installed, print parsed markdown
+			if command -v glow &>/dev/null; then
+				echo -e "${CHATGPT_CYAN_LABEL}"
+				echo "${response_data}" | glow -
+			else
+				# else remove empty lines and print
+				formatted_text=$(echo "${response_data}" | sed '1,2d; s/^A://g')
+				echo -e "${CHATGPT_CYAN_LABEL}${formatted_text}" | fold -s -w $COLUMNS
+			fi
 		else
-			# else remove empty lines and print
-			formatted_text=$(echo "${response_data}" | sed '1,2d; s/^A://g')
-			echo -e "${CHATGPT_CYAN_LABEL}${formatted_text}" | fold -s -w $COLUMNS
+			echo "${response_data}"
 		fi
 
 		if [ "$CONTEXT" = true ]; then
