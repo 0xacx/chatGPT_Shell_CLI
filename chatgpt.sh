@@ -290,6 +290,10 @@ SIZE=${SIZE:-512x512}
 CONTEXT=${CONTEXT:-false}
 MULTI_LINE_PROMPT=${MULTI_LINE_PROMPT:-false}
 
+if [ -z "${COLUMNS}" ]; then
+    COLUMNS=$(tput cols)
+fi
+
 # create our temp file for multi-line input
 if [ $MULTI_LINE_PROMPT = true ]; then
 	USER_INPUT_TEMP_FILE=$(mktemp)
