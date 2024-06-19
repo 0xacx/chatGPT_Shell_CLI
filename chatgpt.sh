@@ -276,8 +276,9 @@ while [[ "$#" -gt 0 ]]; do
 		exit 0
 		;;
 	*)
-		echo "Unknown parameter: $1"
-		exit 1
+		# default mode: use the first parameter as the prompt. Eg: chatgpt "question ?"
+		prompt=$1		
+		shift		
 		;;
 	esac
 done
@@ -289,6 +290,10 @@ MODEL=${MODEL:-gpt-3.5-turbo}
 SIZE=${SIZE:-512x512}
 CONTEXT=${CONTEXT:-false}
 MULTI_LINE_PROMPT=${MULTI_LINE_PROMPT:-false}
+
+if [ -z "${COLUMNS}" ]; then
+    COLUMNS=$(tput cols)
+fi
 
 # create our temp file for multi-line input
 if [ $MULTI_LINE_PROMPT = true ]; then
