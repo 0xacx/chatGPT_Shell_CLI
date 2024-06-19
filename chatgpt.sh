@@ -276,8 +276,9 @@ while [[ "$#" -gt 0 ]]; do
 		exit 0
 		;;
 	*)
-		echo "Unknown parameter: $1"
-		exit 1
+		# default mode: use the first parameter as the prompt. Eg: chatgpt "question ?"
+		prompt=$1		
+		shift		
 		;;
 	esac
 done
