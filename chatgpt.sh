@@ -2,7 +2,7 @@
 
 GLOBIGNORE="*"
 
-CHAT_INIT_PROMPT="You are ChatGPT, a Large Language Model trained by OpenAI. You will be answering questions from users. You answer as concisely as possible for each response (e.g. don’t be verbose). If you are generating a list, do not have too many items. Keep the number of items short. Before each user prompt you will be given the chat history in Q&A form. Output your answer directly, with no labels in front. Do not start your answers with A or Anwser. You were trained on data up until 2021. Today's date is $(date +%m/%d/%Y)"
+CHAT_INIT_PROMPT="You are ChatGPT, a Large Language Model trained by OpenAI. You will be answering questions from users. You answer as concisely as possible for each response (e.g. don't be verbose). If you are generating a list, do not have too many items. Keep the number of items short. Before each user prompt you will be given the chat history in Q&A form. Output your answer directly, with no labels in front. Do not start your answers with A or Answer. You were trained on data up until 2021. Today's date is $(date +%m/%d/%Y)"
 
 SYSTEM_PROMPT="You are ChatGPT, a large language model trained by OpenAI. Answer as concisely as possible. Current date: $(date +%m/%d/%Y). Knowledge cutoff: 9/1/2021."
 
@@ -11,6 +11,7 @@ COMMAND_GENERATION_PROMPT="You are a Command Line Interface expert and your task
 CHATGPT_CYAN_LABEL="\033[36mchatgpt \033[0m"
 PROCESSING_LABEL="\n\033[90mProcessing... \033[0m\033[0K\r"
 OVERWRITE_PROCESSING_LINE="             \033[0K\r"
+DATE_FORMAT="%Y-%m-%d %H:%M"
 
 if [[ -z "$OPENAI_KEY" ]]; then
 	echo "You need to set your OPENAI_KEY to use this script"
@@ -144,8 +145,65 @@ request_to_chat() {
 
 # build chat context before each request for /completions (all models except
 # gpt turbo and gpt 4)
-# $1 should be the escaped request prompt,
-# it extends $chat_context
+
+# Initialize an array to hold chat context messages
+chat_history_context=()
+
+load_history_context() {
+    # Clear the chat_history_context array
+    chat_history_context=()
+		# QA session marker, used to identify the start and end of a QA session, used in the loop below to reverse the lines within each block before extracting Q&A
+		local qa_session_marker="---QA_SESSION---"
+		# Count the number of QA pairs
+		local pair_count=0
+    
+    if [ -f ~/.chatgpt_history ]; then
+        # Process AWK output using process substitution to avoid subshell
+        while IFS= read -r line; do
+            if [[ "$line" == "$qa_session_marker" ]]; then
+                if [[ -n "$block" ]]; then
+                    # Reverse the lines within each block before extracting Q&A
+                    block=$(echo "$block" | awk '{a[i++]=$0} END {for (j=i-1; j>=0;) print a[j--]}')
+										# Extract the question and answer from the block, captures the question until the start of the answer
+                    question=$(echo "$block" | sed -n '/^Q:/,/^A:/p' | sed '$d')
+										# Extract the answer from the block, captures the answer from the start of the answer to the end of the block
+                    answer=$(echo "$block" | sed -n '/^A:/,$p')
+                    
+                    # Prepend to chat_history_context array since we're reading bottom-up
+                    chat_history_context=("$question" "$answer" "${chat_history_context[@]}")
+
+										 # Increment counter and break if we've reached MAX_CONTEXT_SESSIONS
+                    ((pair_count++))
+                    if [ "$pair_count" -ge "$MAX_CONTEXT_SESSIONS" ]; then
+                        break
+                    fi
+                fi
+                block=""
+            else
+                block+="${block:+$'\n'}$line"
+            fi
+        done < <(tail -n $MAX_HISTORY_LINES_SEARCH ~/.chatgpt_history | \
+                awk -v marker="$qa_session_marker" \
+                'BEGIN {RS="[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]"; ORS="\n"marker"\n"} \
+                NR>1{print "Q: " substr($0,2)}' | tac)
+    fi
+}
+
+# Join the current chat_messages array into one string
+get_history_context() {
+  local context=""
+  local separator=$'\n'
+  for msg in "${chat_history_context[@]}"; do
+    context+="${msg}${separator}"
+  done
+  echo "$context"
+}
+
+# Save chat response to history file
+save_to_history() { 
+	echo -e "$1 $2 \nA: $3 \n" >>~/.chatgpt_history; 
+}
+
 build_chat_context() {
 	local escaped_request_prompt="$1"
 	if [ -z "$chat_context" ]; then
@@ -231,6 +289,7 @@ while [[ "$#" -gt 0 ]]; do
 		;;
 	-p | --prompt)
 		prompt="$2"
+		CONTEXT=true
 		shift
 		shift
 		;;
@@ -282,13 +341,20 @@ while [[ "$#" -gt 0 ]]; do
 	esac
 done
 
-# set defaults
+# set defaults if not already set
 TEMPERATURE=${TEMPERATURE:-0.7}
 MAX_TOKENS=${MAX_TOKENS:-1024}
 MODEL=${MODEL:-gpt-3.5-turbo}
 SIZE=${SIZE:-512x512}
 CONTEXT=${CONTEXT:-false}
+MAX_CONTEXT_SESSIONS=${MAX_CONTEXT_SESSIONS:-10}
+MAX_HISTORY_LINES_SEARCH=${MAX_HISTORY_LINES_SEARCH:-999}
 MULTI_LINE_PROMPT=${MULTI_LINE_PROMPT:-false}
+DEBUG=${DEBUG:-false}
+
+if [[ -z "$COLUMNS" || ! "$COLUMNS" =~ ^[0-9]+$ ]]; then
+    COLUMNS=$(tput cols)
+fi
 
 # create our temp file for multi-line input
 if [ $MULTI_LINE_PROMPT = true ]; then
@@ -302,11 +368,30 @@ if [ ! -f ~/.chatgpt_history ]; then
 	chmod 600 ~/.chatgpt_history
 fi
 
+# Load previous chat context from history file into chat_history_context array
+if [ "$CONTEXT" = true ]; then
+	load_history_context
+fi
+
+# Get the context as a string
+SYSTEM_CONTEXT=$(get_history_context)
+# Echo all chat messages (for debugging)
+if [ "$DEBUG" = true ]; then
+	echo "SYSTEM_CONTEXT:"
+	echo "$SYSTEM_CONTEXT"
+fi
+
+# Append the chat context to the system prompt if there is context
+if [ -n "$SYSTEM_CONTEXT" ]; then
+    SYSTEM_PROMPT="${SYSTEM_PROMPT}\nContext:\n${SYSTEM_CONTEXT}"
+fi
+
 running=true
 # check input source and determine run mode
 
 # prompt from argument, run on pipe mode (run once, no chat)
 if [ -n "$prompt" ]; then
+	#prompt is not empty
 	pipe_mode_prompt=${prompt}
 # if input file_descriptor is a terminal, run on chat mode
 elif [ -t 0 ]; then
@@ -403,8 +488,8 @@ while $running; do
 		fi
 		add_assistant_response_to_chat_message "$(escape "$response_data")"
 
-		timestamp=$(date +"%Y-%m-%d %H:%M")
-		echo -e "$timestamp $prompt \n$response_data \n" >>~/.chatgpt_history
+		save_to_history "$(date +"$DATE_FORMAT")" "$prompt" "$response_data"
+
 
 	elif [[ "$MODEL" =~ ^gpt- ]]; then
 		# escape quotation marks, new lines, backslashes...
@@ -425,8 +510,7 @@ while $running; do
 		fi
 		add_assistant_response_to_chat_message "$(escape "$response_data")"
 
-		timestamp=$(date +"%Y-%m-%d %H:%M")
-		echo -e "$timestamp $prompt \n$response_data \n" >>~/.chatgpt_history
+		save_to_history "$(date +"$DATE_FORMAT")" "$prompt" "$response_data"
 	else
 		# escape quotation marks, new lines, backslashes...
 		request_prompt=$(escape "$prompt")
@@ -454,7 +538,6 @@ while $running; do
 			maintain_chat_context "$(escape "$response_data")"
 		fi
 
-		timestamp=$(date +"%Y-%m-%d %H:%M")
-		echo -e "$timestamp $prompt \n$response_data \n" >>~/.chatgpt_history
+		save_to_history "$(date +"$DATE_FORMAT")" "$prompt" "$response_data"
 	fi
 done
